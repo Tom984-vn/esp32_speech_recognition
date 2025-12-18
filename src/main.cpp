@@ -2,8 +2,11 @@
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <Adafruit_GFX.h>
+#include <ArduinoWebsockets.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+
+using namespace websockets;
 
 // ================= OLED =================
 #define SCREEN_WIDTH 128
@@ -21,36 +24,83 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define I2S_PORT    I2S_NUM_0
 
 // ================= AUDIO =================
-#define SAMPLING_FREQUENCY 44100
+#define SAMPLING_FREQUENCY 16000
+#define DMA_BUF_LEN 256
+#define DMA_BUF_COUNT 16
+#define I2S_READ_TIMEOUT 20
 
 // ================= STATE =================
-enum Mode {MODE_IDLE, MODE_REC, MODE_PLAY };
+enum Mode { MODE_IDLE, MODE_REC };
 Mode currentMode = MODE_IDLE;
 
-const char* ssid = "Phong 400";
-const char* password = "Aephong400";
+// ================= WIFI =================
+const char* ssid = "xyz";
+const char* password = "29122011";
 
-// ================= BUFFER =================
-// const int TOTAL_SAMPLES = SAMPLING_FREQUENCY * RECORD_TIME;
-int16_t *recording_buffer;
+// ================= WS =================
+const uint16_t ws_port = 8000;
+const char* ws_path = "/ws/audio";
+unsigned long lastWSAttempt = 0;
 
-//Wifi
-void connect_wifi(){
+#define FORCED_SERVER_IP "192.168.137.1"
+
+WebsocketsClient client;
+volatile bool wsConnected = false;
+
+// ================= WIFI =================
+void connect_wifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(ssid, password);
+
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi..");
+    delay(500);
+    Serial.print(".");
   }
-  Serial.println("Connected to the WiFi network");
+
+  Serial.println("\n[WiFi] Connected");
+  Serial.print("[WiFi] ESP IP: ");
+  Serial.println(WiFi.localIP());
 }
 
-// I2S func
-void i2s_uninstall() {
-  i2s_driver_uninstall(I2S_PORT);
+// ================= WS EVENTS =================
+void onEvents(WebsocketsEvent event, String data) {
+  if (event == WebsocketsEvent::ConnectionOpened) {
+    wsConnected = true;
+    Serial.println("[WS] Connected");
+  }
+
+  if (event == WebsocketsEvent::ConnectionClosed) {
+    wsConnected = false;
+    Serial.println("[WS] Disconnected");
+  }
 }
 
+// ================= WS CONNECT =================
+void connectWS() {
+  if (wsConnected) return;
+
+  if (millis() - lastWSAttempt < 3000) return;
+  lastWSAttempt = millis();
+  static bool initialized = false;
+  if (!initialized) {
+    client.onEvent(onEvents);
+    initialized = true;
+  }
+
+  Serial.print("[WS] Connecting to ");
+  Serial.println(FORCED_SERVER_IP);
+
+  client.close(); 
+  delay(200);
+  bool ok = client.connect(FORCED_SERVER_IP, ws_port, ws_path);
+  if (!ok) {
+    Serial.println("[WS] Connect failed");
+  }
+}
+
+
+// ================= I2S =================
 void i2s_setpin() {
   const i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_SCK,
@@ -69,8 +119,8 @@ void i2s_install_rx() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 64,
+    .dma_buf_count = DMA_BUF_COUNT,
+    .dma_buf_len = DMA_BUF_LEN,
     .use_apll = false
   };
   i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
@@ -78,125 +128,94 @@ void i2s_install_rx() {
   i2s_zero_dma_buffer(I2S_PORT);
 }
 
-void i2s_install_tx() {
-  const i2s_config_t cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLING_FREQUENCY,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 64,
-    .use_apll = false,
-    .tx_desc_auto_clear = true
-  };
-  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
-  i2s_setpin();
-  i2s_zero_dma_buffer(I2S_PORT);
-}
-
-// OLED
-void run_text_recognizer() {
-  display.clearDisplay();
-
-  display.display();
-}
-
-
-// =================================================
-// ================= RECORD =========================
-// =================================================
+// ================= RECORD =================
 void record_audio() {
   display.clearDisplay();
-  display.setCursor(20, 25);
+  display.setCursor(10, 25);
   display.println("RECORDING...");
   display.display();
 
-  int samples = 0;
-  int32_t temp[64];
+  static int32_t raw[DMA_BUF_LEN];
+  static int16_t pcm[DMA_BUF_LEN];
+  static uint8_t tx_buffer[sizeof(uint32_t) + DMA_BUF_LEN * sizeof(int16_t)];
+
+  uint32_t packet_seq = 0;
   size_t bytes;
 
   while (digitalRead(BUTTON_PIN) == LOW) {
-    i2s_read(I2S_PORT, temp, sizeof(temp), &bytes, portMAX_DELAY);
-    int count = bytes / 4;
-/*
-    for (int i = 0; i < count && samples < TOTAL_SAMPLES; i++) {
-      recording_buffer[samples++] = (int16_t)(temp[i] >> 14);
+    if (!wsConnected) continue;
+
+    client.poll();
+
+    if (i2s_read(I2S_PORT, raw, sizeof(raw), &bytes,
+                 I2S_READ_TIMEOUT / portTICK_PERIOD_MS) != ESP_OK) {
+      continue;
     }
-  }
-*/
+
+    int samples = bytes / 4;
+    for (int i = 0; i < samples; i++) {
+      pcm[i] = raw[i] >> 14;
+    }
+
+    memcpy(tx_buffer, &packet_seq, sizeof(uint32_t));
+    memcpy(tx_buffer + sizeof(uint32_t),
+           pcm, samples * sizeof(int16_t));
+
+    client.sendBinary(
+      (const char*)tx_buffer,
+      sizeof(uint32_t) + samples * sizeof(int16_t)
+    );
+
+    packet_seq++;
   }
 
-}
+  if (wsConnected) {
+    client.send("END");
+  }
 
-// =================================================
-// ================= PLAY ===========================
-// =================================================
-void play_audio(int samples) {
   display.clearDisplay();
-  display.setCursor(30, 25);
-  display.println("PLAYING...");
+  display.setCursor(20, 25);
+  display.println("DONE");
   display.display();
-
-  int32_t temp[64];
-  size_t bytes;
-  int idx = 0;
-
-  while (idx < samples) {
-    int n = 0;
-    while (n < 64 && idx < samples) {
-      temp[n++] = ((int32_t)recording_buffer[idx++]) << 14;
-    }
-    i2s_write(I2S_PORT, temp, n * 4, &bytes, portMAX_DELAY);
-  }
 }
 
-// SETUP
-
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-
+  delay(1000);
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.setTextColor(WHITE);
-  connect_wifi();
-  recording_buffer = (int16_t *)heap_caps_malloc(
-    TOTAL_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT
-  );
 
+  display.clearDisplay();
+  display.setCursor(10, 25);
+  display.println("Initializing...");
+  display.display();
+
+  connect_wifi();
   i2s_install_rx();
 }
 
-
-// =================================================
-// ================= LOOP ===========================
-// =================================================
-
+// ================= LOOP =================
 void loop() {
+  if (wsConnected) {
+    client.poll();
+  } else {
+    connectWS();
+  }
+
   if (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50);
+    delay(30);
     if (digitalRead(BUTTON_PIN) == LOW) {
-      // === RECORD ===
       currentMode = MODE_REC;
-      i2s_uninstall();
-      i2s_install_rx();
       record_audio();
-
-      // === PLAY ===
-      currentMode = MODE_PLAY;
-      i2s_uninstall();
-      i2s_install_tx();
-      play_audio();
-
-      // === BACK TO VIS ===
       currentMode = MODE_IDLE;
-      i2s_uninstall();
-      i2s_install_rx();
-
       while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     }
   }
-
+  display.clearDisplay();
+  display.setCursor(10, 25);
+  display.println("Idle...");
+  display.display();
 }
